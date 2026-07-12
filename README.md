@@ -65,10 +65,11 @@ it. No installer, no other files needed.
   `2, 4, 6, 8, 10, 12, 16, 18` V — picking one auto-fills its confirmed
   default voltage alarm pair (you can still edit those afterward).
   Temperature is entered in Fahrenheit and stored on the device as Celsius.
-  When you add a string you also pick an initial jar
-  count — jars are auto-named `BAT1`, `BAT2`, ... and can be renamed or
-  added/removed afterwards in the Jars tab. Deleting a string that still
-  contains jars is blocked.
+  When you add a string you also pick an initial jar count (1-240, the
+  device's confirmed maximum per string) — jars are auto-named `BAT1`,
+  `BAT2`, ... and can be renamed or added/removed afterwards in the Jars
+  tab, up to that same 240-jar cap. Deleting a string that still contains
+  jars is blocked.
 - **Battery library autocomplete** (left sidebar, or File → Import Battery
   Library...): import a `.lib` battery library exported from CellLibrarian
   (or the device itself) and the Manufacturer/Model fields in the String
@@ -101,7 +102,10 @@ it. No installer, no other files needed.
   corrupting data it can't safely round-trip. See [SPEC.md](SPEC.md) §9.
 - The device erases its existing database on import — always keep a backup of
   a working `.CDO` before importing a new one.
-- The `count` rollup used for multi-plant/multi-string trees is this tool's
-  own extrapolation from a single confirmed example; see [SPEC.md](SPEC.md)
-  §11 if you build large multi-string trees and want to double-check against
-  a real unit.
+- The `count` field on multi-plant/multi-string trees follows a confirmed
+  propagation rule (first string's jar count propagates up through its plant
+  and site — never a sum); see [SPEC.md](SPEC.md) §11 for the exact rule and
+  a worked example.
+- The format has been confirmed against a real hardware import→export
+  round-trip, not just static analysis of sample files — see the note at the
+  top of [SPEC.md](SPEC.md).

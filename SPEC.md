@@ -1,10 +1,20 @@
 # Celltron `.CDO` (Celltron Data Offline) — File Format Specification
 > Reverse-engineered from device firmware (import parser at `0x0802A818`) and
-> **verified byte-for-byte against a real `.CDO`** produced by the Celltron Max
-> desktop software. The generator in this repo (`cdo_format.py`) produces
-> site/plant/string/jar records **identical** to a real file for the confirmed
-> single-tree case (see §12 for the multi-site/multi-string generalization,
-> which is this tool's own extrapolation).
+> **verified byte-for-byte against multiple real `.CDO` files** (single-site,
+> multi-site, differential-config, and multi-plant exports) produced by the
+> Celltron Max desktop software. The generator in this repo (`cdo_format.py`)
+> produces site/plant/string/jar records **identical** to real files, including
+> the multi-plant `count` propagation rule and the deterministic STRING `id`
+> (see §6 and §11) — neither of those is an extrapolation anymore.
+>
+> **Hardware round-trip confirmed:** a comprehensive generated `.CDO` (2 sites, 3
+> plants, 5 strings exercising every test-type/tests/straps/voltage/threshold
+> combination, including a 240-jar string) was imported into a real tester and
+> then exported. The export was **byte-for-byte identical** to the imported file
+> except for the single header counter byte at `+0x00` (§4). No field was
+> normalized, dropped, or rejected; no size limit was tripped short of the
+> 240-jar-per-string cap (§6). The format below is confirmed against live
+> device import **and** export, not just a single real-world sample file.
 
 Purpose: enable a developer to build a program that writes custom `.CDO`
 **site-template** files (Site → Plant → String → Jar trees) for loading into
@@ -55,16 +65,26 @@ past these 50 bytes on import (it does not parse them), but the desktop software
 writes this signature and it should be present.
 
 ## 4. Header (10 bytes, offset `0x32`)
-| Offset | Size | Field   | Value / meaning                                            |
-|-------:|-----:|---------|-------------------------------------------------------------|
-| `0x00` | 1    | start   | `0x0A` — node data begins at **region offset `0x0A`**      |
-| `0x01` | 1    | version | `0x02` — **required**; any other value is rejected         |
-| `0x02` | 4    | size    | `u32 LE` — total region bytes used = header(10) + all nodes |
-| `0x06` | 4    | reserved| `0x00 00 00 00`                                             |
+| Offset | Size | Field    | Value / meaning                                            |
+|-------:|-----:|----------|-------------------------------------------------------------|
+| `0x00` | 1    | counter  | export-side value; **import-ignored** (see note below)     |
+| `0x01` | 1    | version  | `0x02` — **required**; any other value is rejected         |
+| `0x02` | 4    | size     | `u32 LE` — total region bytes used = header(10) + all nodes |
+| `0x06` | 4    | reserved | `0x00 00 00 00`                                             |
 
 `size` equals the "next free offset" in the flash region after import, i.e.
 `10 + (total node bytes)`. The device bounds-checks `0x5C0000 + size + 0x32 <
 0x800000`.
+
+**Byte `+0x00` is import-ignored.** The import parser reads only `+0x01`
+(version) and `+0x02` (size); it never reads `+0x00`. Its value in real files
+is *not* content-deterministic (observed `0x0A`, `0x12`, `0x22` across
+exports with no consistent relationship to node counts) — it is an export-side
+save/modification counter. **Confirmed by hardware round-trip:** an imported
+file whose `+0x00` was `0x0A` re-exported with `+0x00 = 0x47`, while every
+other byte in the file was unchanged. A generator may write any value here
+(`0x0A` is a safe default); the device overwrites it on its own export. Node
+data always begins at region offset `0x0A` regardless of this byte.
 
 ## 5. The region / pointer model (important)
 All node link fields (`prev`, `next`, `parent`, `child`, and string `id`) are
@@ -91,10 +111,28 @@ pointer fields using those offsets.
 | `0x05` | 4    | next   | region offset of next sibling, or `0xFFFFFFFF`             |
 | `0x09` | 4    | parent | region offset of parent node, or `0xFFFFFFFF` (SITE=null)  |
 | `0x0D` | 4    | child  | region offset of first child, or `0xFFFFFFFF`             |
-| `0x11` | 4    | id     | `u32`; `0xFFFFFFFF` = none (see §9 for STRING)             |
+| `0x11` | 4    | id     | `u32`; on STRING = `region_offset + 0x6E` (deterministic, see below); else `0xFFFFFFFF` |
 | `0x15` | 1    | flag   | see per-type values below                                  |
 | `0x16` | 50   | name   | ASCII, null-padded (`char[0x32]`)                          |
-| `0x6C` | 2    | count  | `u16` — jar count (see §11)                                |
+| `0x6C` | 2    | count  | `u16` — jars-per-string, propagated (see §11)              |
+
+**`count` (`+0x6C`) is a propagation, not a sum** — confirmed against
+multi-plant real exports. On a STRING it is that string's own jar count. On a
+PLANT it is the jar count of the plant's **first string**. On a SITE it is the
+jar count of that site's first plant's first string. It **never** sums or
+totals jar counts across multiple strings/plants. See §11 for the worked
+example.
+
+**STRING `id` (`+0x11`) is deterministic:** always `region_offset + 0x6E`
+(the region address of the STRING's own extension block, right after its
+common header) — confirmed across 15/15 real strings and preserved through a
+hardware import/export round-trip. A generator must compute this from the
+string's actual position; it is not a placeholder and not user-settable.
+
+**Jar-count limit:** a string may hold **1–240 jars** (device-enforced
+maximum, confirmed via hardware round-trip — a 240-jar string imported and
+re-exported intact). A builder should reject counts outside this range;
+`cdo_format.py` does via `validate_jar_count()`.
 
 **Record sizes by type:**
 | Type   | Size          |
@@ -188,43 +226,80 @@ nominal voltages below and auto-fills its confirmed defaults):
 | 16 V | 20.000 | 17.600 | 20000 | 17600 |
 | 18 V | 22.500 | 19.800 | 22500 | 19800 |
 
-## 9. MEASUREMENT record (60 bytes) — not supported by this tool
-Present only for jars that have been tested. A **template** does not emit these
-(jar `child = null`). The 60-byte layout was not fully decoded and is not
-needed to author a template. `cdo_format.py` refuses to parse a JAR whose
-`child` pointer is non-null — this tool is for un-tested site templates only,
-and re-packing an existing tested database here would leave the opaque
-MEASUREMENT bytes pointing at stale offsets.
+## 9. MEASUREMENT record (60 bytes, type `5`) — decoded, but not built by this tool
+Present only for jars that have been tested (a tested jar's `child` points to
+one). A **template** does not emit these — keep jar `child = null`. Decoded
+from real measurement records; documented here for *reading* result files,
+even though `cdo_format.py` deliberately doesn't build or re-pack them (see
+below).
+
+| Offset | Size | Field | Notes |
+|-------:|-----:|-------|-------|
+| `0x00` | 1  | type        | `5` |
+| `0x01` | 4  | prev        | region offset or `0xFFFFFFFF` |
+| `0x05` | 4  | next        | region offset or `0xFFFFFFFF` |
+| `0x09` | 4  | parent      | region offset of the JAR this measurement belongs to |
+| `0x0D` | 5  | timestamp   | packed date/time; encoding not fully decoded (only remaining unknown — irrelevant to authoring templates) |
+| `0x14` | 2  | conductance | `u16 LE` — measured conductance |
+| `0x16` | 2  | voltage     | `u16 LE` — measured voltage, millivolts |
+| `0x18` | 1  | temperature | `u8` — degrees Celsius |
+| `0x19` | 1  | (unknown)   | typically `0x00` |
+| `0x1A`–`0x3B` | 22 | padding | `0xFF` |
+
+**Note:** unlike SITE/PLANT/STRING/JAR, a MEASUREMENT record does **not** use
+the common header layout (§6) — it's only 60 bytes total, smaller than the
+110-byte common header. Offset `+0x0D` onward is measurement data, not a
+`child`/`id`/`flag`/`name` block; only `prev`/`next`/`parent` are links.
+
+`cdo_format.py` refuses to parse a JAR whose `child` pointer is non-null —
+this tool is for authoring un-tested site templates only. Editing an existing
+tested database is out of scope, so it never needs to re-pack MEASUREMENT
+bytes.
 
 ## 10. Confirmed vs. unconfirmed
-**Confirmed (matches a real `.CDO` byte-for-byte for a single site/plant/string
-tree):** signature, header, the region pointer model, the SITE/PLANT/STRING/JAR
-record layouts and sizes, flags, the `0xFF` tail padding, the `count` (jar-count)
-semantics for that case, the STRING battery block (tech-id, conductance,
-manufacturer, model, GUID), and the config/threshold block field layouts
-(§8.1/§8.2).
+**Confirmed (matches real `.CDO` files byte-for-byte, verified against
+single-site, multi-site, differential-config, and multi-plant exports, plus a
+full hardware import→export round-trip):** signature, header, the region
+pointer model, the SITE/PLANT/STRING/JAR record layouts and sizes, flags, the
+`0xFF` tail padding, the `count` (jar-count) propagation rule (§11), the
+STRING `id` formula (§6), the STRING battery block (tech-id, conductance,
+manufacturer, model, GUID), the config/threshold block field layouts
+(§8.1/§8.2), header byte `+0x00` being import-ignored, and the MEASUREMENT
+record's conductance/voltage/temperature fields (§9).
 
-**Not fully decoded / verify on device:**
-- **STRING `id` (`+0x11`)**: real files carry values (e.g. 4900). This tool
-  writes the string's own region offset as a placeholder when creating a new
-  string (matches the confirmed reference generator), and preserves whatever
-  value it read when round-tripping an existing file. The device may expect a
-  specific numbering; confirm by importing and re-exporting.
-- **MEASUREMENT record internals**: not needed for templates; not decoded; not
-  supported by this tool (see §9).
+**Additionally confirmed by the hardware round-trip specifically** (device
+import followed by device export, byte-diffed against the original):
+- **STRING `id`** survives round-trip unchanged.
+- **Header `+0x00`** is genuinely ignored and rewritten by the device on its
+  own export (`0x0A` in → `0x47` out), confirming it's never load-bearing.
+- **Jar count up to the device maximum of 240 jars per string** imports and
+  re-exports intact, with every other byte unchanged.
+- **Fahrenheit↔Celsius** temperature storage survives round-trip (values are
+  kept in °C on-device and in the file; only the GUI's display unit differs).
+- Every test-type / tests-per-jar / straps-per-jar / voltage / threshold
+  combination exercised round-tripped with no normalization, drop, or
+  rejection.
+
+**Remaining minor unknown (does not affect authoring or import):**
+- The exact encoding of the 5-byte MEASUREMENT **timestamp** (`+0x0D`, §9).
+  Only relevant if generating synthetic test results, which template
+  authoring never does.
 
 ## 11. `count` field for multi-plant / multi-string trees
-The only real example this spec was verified against has exactly one plant
-per site and one string per plant, where `count` (jar count, `+0x6C`) is
-written identically on SITE, PLANT, and STRING (e.g. 4 jars → `4` on all
-three). For a tree with multiple plants or multiple strings, the device's
-exact expectation for the SITE/PLANT `count` rollup is **unconfirmed**.
+`count` (jar count, `+0x6C`) **propagates the first string's jar count up the
+tree — it is never a sum or total.** Confirmed against real multi-plant
+exports.
 
-This tool's generator (`cdo_format.py`) uses a rollup rule chosen to degenerate
-correctly to the confirmed case: `PLANT.count` = sum of jar counts across all
-its strings; `SITE.count` = sum of jar counts across all its plants. `STRING.count`
-is always its own exact jar count (unambiguous). If you build multi-string
-trees, confirm this rollup by importing and re-exporting on a real unit.
+- On a **STRING**: its own jar count (e.g. a 6-jar string → `6`).
+- On a **PLANT**: the jar count of the plant's **first string**.
+- On a **SITE**: the jar count of that site's first plant's first string.
+- On a **JAR**: `0`.
+
+Worked example — a site with plant A (strings hold 4 jars) and plant B (a
+6-jar string): `SITE = 4`, `PLANT A = 4`, `PLANT B = 6`, each STRING = its own
+count. For the common single-string-per-plant case this degenerates to "same
+count everywhere," which is what simple templates produce — so existing
+single-string templates are unaffected by this rule.
 
 ## 12. Multiple sites
 Top-level sites chain via `next`. To emit several sites, lay out every node

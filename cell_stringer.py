@@ -313,9 +313,11 @@ class StringDialog(tk.Toplevel):
 
         self.jar_count_var = tk.StringVar(value=str(DEFAULT_JAR_COUNT))
         if show_jar_count:
-            ttk.Label(left, text="Number of jars:").grid(row=row, column=0, sticky="w")
+            ttk.Label(left, text=f"Number of jars (1-{fmt.MAX_JARS_PER_STRING}):").grid(
+                row=row, column=0, sticky="w")
             row += 1
-            ttk.Spinbox(left, from_=1, to=65535, textvariable=self.jar_count_var, width=10).grid(
+            ttk.Spinbox(left, from_=fmt.MIN_JARS_PER_STRING, to=fmt.MAX_JARS_PER_STRING,
+                        textvariable=self.jar_count_var, width=10).grid(
                 row=row, column=0, sticky="w", pady=(2, 8))
             row += 1
             ttk.Label(left, text="(jars are auto-named BAT1, BAT2, ... -- rename or add/remove\n"
@@ -454,7 +456,6 @@ class StringDialog(tk.Toplevel):
             manufacturer=self.mfr_var.get().strip(),
             model=self.model_var.get().strip(),
             guid=self._battery.guid if self._battery else fmt.new_guid(),
-            string_id=self._battery.string_id if self._battery else None,
             test_type=_TEST_TYPE_BY_LABEL[self.test_type_var.get()],
             tests_per_jar=tests_per_jar,
             straps_per_jar=_STRAPS_BY_LABEL[self.straps_var.get()],
@@ -478,11 +479,14 @@ class StringDialog(tk.Toplevel):
         if self.jar_count_var.get():
             try:
                 jar_count = int(self.jar_count_var.get())
-                if jar_count < 1:
-                    raise ValueError
             except ValueError:
-                messagebox.showerror("Invalid jar count", "Number of jars must be a positive integer.",
+                messagebox.showerror("Invalid jar count", "Number of jars must be an integer.",
                                       parent=self)
+                return
+            try:
+                fmt.validate_jar_count(jar_count, name)
+            except fmt.CdoFormatError as e:
+                messagebox.showerror("Invalid jar count", str(e), parent=self)
                 return
 
         self.result = dict(name=name, plant_label=self.plant_var.get(), battery=battery,
@@ -1035,6 +1039,13 @@ class CellStringerApp(tk.Tk):
         string = self._resolve_string_label(string_label)
         if any(j.name == name for j in string.jars):
             messagebox.showerror("Duplicate", f"This string already has a jar named '{name}'.")
+            return
+        if len(string.jars) >= fmt.MAX_JARS_PER_STRING:
+            messagebox.showerror(
+                "Jar limit reached",
+                f"'{string.name}' already has {len(string.jars)} jars, the device maximum "
+                f"({fmt.MAX_JARS_PER_STRING}) per string.",
+            )
             return
         string.jars.append(fmt.Jar(name=name))
         self._mark_dirty()

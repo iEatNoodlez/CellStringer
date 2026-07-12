@@ -9,7 +9,9 @@ File format summary (see SPEC.md for the full reverse-engineered spec):
         "File created by Celltron Max", space-padded.
 
     Header (10 bytes, at file offset 0x32):
-        0x00  u8       start = 0x0A (node data begins at region offset 0x0A)
+        0x00  u8       counter (export-side save/modification counter;
+                        import-ignored -- node data always starts at region
+                        offset 0x0A regardless of this byte's value)
         0x01  u8       version = 0x02 (required)
         0x02  u32 LE   size (header + all node bytes)
         0x06  u32      reserved = 0
@@ -24,10 +26,10 @@ File format summary (see SPEC.md for the full reverse-engineered spec):
 
 A template (a site defined but not yet tested) has JAR.child = null -- no
 MEASUREMENT record. This engine only builds/reads templates: a JAR whose
-child pointer is non-null (already has test results) is refused on parse,
-since editing a tested database is out of scope and re-packing it here
-would leave the opaque, undecoded MEASUREMENT bytes pointing at stale
-offsets.
+child pointer is non-null (already has test results) is refused on parse.
+MEASUREMENT records are decoded (see SPEC.md Section 9) but out of scope
+for template authoring, so this engine deliberately doesn't build or
+re-pack them.
 """
 
 from __future__ import annotations
@@ -46,6 +48,11 @@ PLANT_SIZE = 0x6E   # 110
 STRING_SIZE = 0xF6  # 246
 JAR_SIZE = 0x6E     # 110
 MEAS_SIZE = 0x3C    # 60
+
+COMMON_HEADER_SIZE = 0x6E  # 110; SITE/PLANT/JAR records are exactly this
+
+MIN_JARS_PER_STRING = 1
+MAX_JARS_PER_STRING = 240  # device-enforced maximum; confirmed via hardware import/export round-trip
 
 SIGNATURE_TEXT = b"File created by Celltron Max"
 SIGNATURE_SIZE = 0x32  # 50
@@ -118,8 +125,11 @@ def new_guid() -> str:
 class BatteryAssignment:
     """The battery-model link + test settings carried on a STRING record.
     tech_id/conductance/manufacturer/model and the test/alarm settings below
-    are meaningful to a human; guid/string_id are device plumbing that this
-    tool preserves or defaults but never surfaces in the GUI.
+    are meaningful to a human; guid is device plumbing that this tool
+    preserves or defaults but never surfaces in the GUI. The STRING `id`
+    field (+0x11) is not stored here at all -- it's deterministic
+    (region_offset + 0x6E, confirmed 15/15 real strings) and always
+    computed fresh at build time in build_cdo().
 
     Test/alarm fields map onto the STRING record's config block (+0x87, 7
     bytes) and threshold block (+0x90, 14 bytes) -- see SPEC.md Section 8."""
@@ -128,7 +138,6 @@ class BatteryAssignment:
     manufacturer: str
     model: str
     guid: str = field(default_factory=new_guid)
-    string_id: int | None = None       # None -> use the STRING's own region offset at build time
 
     # config block (+0x87)
     test_type: int = TEST_TYPE_VOLTS_AND_COND   # +0x87
@@ -204,6 +213,16 @@ def validate_name(name: str, field_name: str = "Name") -> None:
     """Public pre-flight check for a node name (site/plant/string/jar), for
     GUI dialogs to call before the user can even try to save."""
     _pad_ascii(name, NAME_FIELD_SIZE, field_name)
+
+
+def validate_jar_count(count: int, string_name: str) -> None:
+    """Public pre-flight check for a string's jar count against the
+    device-enforced 1-240 range (confirmed via hardware round-trip)."""
+    if not (MIN_JARS_PER_STRING <= count <= MAX_JARS_PER_STRING):
+        raise CdoFormatError(
+            f"String '{string_name}' has {count} jar(s); the device only accepts "
+            f"{MIN_JARS_PER_STRING}-{MAX_JARS_PER_STRING} jars per string"
+        )
 
 
 def validate_string_fields(name: str, battery: BatteryAssignment) -> None:
@@ -321,10 +340,15 @@ def _write_common_header(b: bytearray, typ: int, prev: int, nxt: int, parent: in
     struct.pack_into("<H", b, 0x6C, count & 0xFFFF)
 
 
-def _rollup_jar_count(strings: list[String]) -> int:
-    total = sum(len(s.jars) for s in strings)
-    _validate_u16(total, "Jar count")
-    return total
+def _first_string_jar_count(strings: list[String]) -> int:
+    # `count` (+0x6C) propagates the *first* string's jar count up through
+    # its plant and site -- confirmed against multi-plant real exports.
+    # It is never a sum/total: a site with one plant holding a 4-jar string
+    # and another plant holding a 6-jar string still writes SITE.count = 4
+    # (that first plant's first string's count), not 10.
+    count = len(strings[0].jars)
+    _validate_u16(count, "Jar count")
+    return count
 
 
 def build_cdo(sites: list[Site]) -> bytes:
@@ -354,8 +378,7 @@ def build_cdo(sites: list[Site]) -> bytes:
             plan.append((TYPE_PLANT, plant, PLANT_SIZE))
             cursor += PLANT_SIZE
             for string in plant.strings:
-                if not string.jars:
-                    raise CdoFormatError(f"String '{string.name}' has no jars")
+                validate_jar_count(len(string.jars), string.name)
                 _validate_battery(string.battery, string.name)
                 offsets[id(string)] = cursor
                 plan.append((TYPE_STRING, string, STRING_SIZE))
@@ -380,9 +403,7 @@ def build_cdo(sites: list[Site]) -> bytes:
         b = _blank_node(SITE_SIZE)
         _write_common_header(
             b, TYPE_SITE, prev_site, next_site, NULL, offsets[id(site.plants[0])],
-            NULL, FLAG_SITE, site.name, _rollup_jar_count(
-                [s for p in site.plants for s in p.strings]
-            ),
+            NULL, FLAG_SITE, site.name, _first_string_jar_count(site.plants[0].strings),
         )
         out += b
 
@@ -393,7 +414,7 @@ def build_cdo(sites: list[Site]) -> bytes:
             _write_common_header(
                 b, TYPE_PLANT, prev_plant, next_plant, offsets[id(site)],
                 offsets[id(plant.strings[0])], NULL, FLAG_PLANT, plant.name,
-                _rollup_jar_count(plant.strings),
+                _first_string_jar_count(plant.strings),
             )
             out += b
 
@@ -401,7 +422,11 @@ def build_cdo(sites: list[Site]) -> bytes:
                 prev_string = offsets[id(plant.strings[string_idx - 1])] if string_idx > 0 else NULL
                 next_string = offsets[id(plant.strings[string_idx + 1])] if string_idx + 1 < len(plant.strings) else NULL
                 string_offset = offsets[id(string)]
-                node_id = string.battery.string_id if string.battery.string_id is not None else string_offset
+                # STRING id (+0x11) = its own region offset + the common
+                # header size (the region address of the STRING's own
+                # extension block, right after its common header) --
+                # confirmed deterministic across 15/15 real strings.
+                node_id = string_offset + COMMON_HEADER_SIZE
                 b = _blank_node(STRING_SIZE)
                 _write_common_header(
                     b, TYPE_STRING, prev_string, next_string, offsets[id(plant)],
@@ -437,7 +462,7 @@ def build_cdo(sites: list[Site]) -> bytes:
                     out += b
 
     header = bytearray(HEADER_SIZE)
-    header[0] = NODE_START
+    header[0] = NODE_START  # import-ignored counter byte; 0x0A is a safe default
     header[1] = 0x02
     struct.pack_into("<I", header, 0x02, total_region_size)
 
@@ -503,9 +528,13 @@ def _read_string(data: bytes, region_off: int) -> String:
         "ascii", errors="replace")
     guid = data[file_off + 0xD2:file_off + 0xD2 + 36].decode("ascii", errors="replace")
 
+    # hdr["id"] is intentionally discarded: STRING id is deterministic
+    # (region_offset + COMMON_HEADER_SIZE) and build_cdo() always recomputes
+    # it fresh from each string's actual position, so there's nothing to
+    # preserve here even if a source file's stored value were stale.
     battery = BatteryAssignment(
         tech_id=tech_id, conductance=conductance, manufacturer=mfr, model=model,
-        guid=guid, string_id=hdr["id"], **config_kwargs, **threshold_kwargs,
+        guid=guid, **config_kwargs, **threshold_kwargs,
     )
 
     jars: list[Jar] = []
@@ -577,10 +606,12 @@ def parse_cdo(data: bytes) -> list[Site]:
         raise CdoFormatError("File is too small to contain a signature and header")
 
     header = data[SIGNATURE_SIZE:SIGNATURE_SIZE + HEADER_SIZE]
-    start, version = header[0], header[1]
+    # header[0] is an export-side save/modification counter -- the import
+    # parser never reads it, and real files carry varying values (0x0A,
+    # 0x12, 0x22, ...). Node data always starts at region offset NODE_START
+    # regardless of this byte, so it is intentionally not validated here.
+    version = header[1]
     size = struct.unpack_from("<I", header, 0x02)[0]
-    if start != NODE_START:
-        raise CdoFormatError(f"Header 'start' is 0x{start:02X}, expected 0x{NODE_START:02X}")
     if version != 0x02:
         raise CdoFormatError(f"Header version is 0x{version:02X}; only version 0x02 is supported")
     expected_file_size = FILE_NODE_START + (size - HEADER_SIZE)
