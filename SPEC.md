@@ -239,12 +239,28 @@ below).
 | `0x01` | 4  | prev        | region offset or `0xFFFFFFFF` |
 | `0x05` | 4  | next        | region offset or `0xFFFFFFFF` |
 | `0x09` | 4  | parent      | region offset of the JAR this measurement belongs to |
-| `0x0D` | 5  | timestamp   | packed date/time; encoding not fully decoded (only remaining unknown — irrelevant to authoring templates) |
+| `0x0D` | 5  | timestamp   | date/time, **minute resolution** — fully decoded, see table below |
 | `0x14` | 2  | conductance | `u16 LE` — measured conductance |
 | `0x16` | 2  | voltage     | `u16 LE` — measured voltage, millivolts |
 | `0x18` | 1  | temperature | `u8` — degrees Celsius |
-| `0x19` | 1  | (unknown)   | typically `0x00` |
+| `0x19` | 1  | (unknown)   | typically `0x00` — immaterial for both authoring and reading |
 | `0x1A`–`0x3B` | 22 | padding | `0xFF` |
+
+**Timestamp (`+0x0D`, 5 bytes) — decoded** against 1,204 real measurements:
+
+| Offset | Field | Range |
+|-------:|-------|-------|
+| `0x0D` | minute | 0–59 |
+| `0x0E` | hour   | 0–23 |
+| `0x0F` | day    | 1–31 |
+| `0x10` | month  | 1–12 |
+| `0x11` | year   | two-digit, + 2000 |
+
+Example `08 09 0F 04 19` = 2025-04-15 09:08. Seconds are not stored. Bytes
+`+0x12`, `+0x13` are `0xFF`.
+
+Sanity check from real data: 12V jars read ~13500 mV / ~1500–2000 conductance;
+2V cells ~2000 mV / ~4000–5400 conductance; temps 18–19 °C.
 
 **Note:** unlike SITE/PLANT/STRING/JAR, a MEASUREMENT record does **not** use
 the common header layout (§6) — it's only 60 bytes total, smaller than the
@@ -256,7 +272,7 @@ this tool is for authoring un-tested site templates only. Editing an existing
 tested database is out of scope, so it never needs to re-pack MEASUREMENT
 bytes.
 
-## 10. Confirmed vs. unconfirmed
+## 10. Confirmed — nothing material remains unknown
 **Confirmed (matches real `.CDO` files byte-for-byte, verified against
 single-site, multi-site, differential-config, and multi-plant exports, plus a
 full hardware import→export round-trip):** signature, header, the region
@@ -264,8 +280,8 @@ pointer model, the SITE/PLANT/STRING/JAR record layouts and sizes, flags, the
 `0xFF` tail padding, the `count` (jar-count) propagation rule (§11), the
 STRING `id` formula (§6), the STRING battery block (tech-id, conductance,
 manufacturer, model, GUID), the config/threshold block field layouts
-(§8.1/§8.2), header byte `+0x00` being import-ignored, and the MEASUREMENT
-record's conductance/voltage/temperature fields (§9).
+(§8.1/§8.2), header byte `+0x00` being import-ignored, and the full
+MEASUREMENT record including the timestamp encoding (§9).
 
 **Additionally confirmed by the hardware round-trip specifically** (device
 import followed by device export, byte-diffed against the original):
@@ -280,10 +296,11 @@ import followed by device export, byte-diffed against the original):
   combination exercised round-tripped with no normalization, drop, or
   rejection.
 
-**Remaining minor unknown (does not affect authoring or import):**
-- The exact encoding of the 5-byte MEASUREMENT **timestamp** (`+0x0D`, §9).
-  Only relevant if generating synthetic test results, which template
-  authoring never does.
+**Nothing material remains unknown.** The MEASUREMENT timestamp (previously
+the last open field) is now decoded — minute/hour/day/month/year, confirmed
+against 1,204 real measurements (§9). The one loose end, byte `+0x19` of the
+MEAS record (consistently `0x00`), is immaterial for both authoring
+(templates never emit MEAS) and reading.
 
 ## 11. `count` field for multi-plant / multi-string trees
 `count` (jar count, `+0x6C`) **propagates the first string's jar count up the
